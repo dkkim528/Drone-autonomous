@@ -20,7 +20,13 @@
   <depend>tf2_geometry_msgs</depend>
 
   <depend>octomap_msgs</depend>
-  <depend>liboctomap-dev</depend> <depend>interactive_markers</depend>
+  <depend>liboctomap-dev</depend> 
+  <depend>interactive_markers</depend>
+
+  <depend>std_srvs</depend>
+  <depend>pcl_conversions</depend>
+  <depend>pcl_ros</depend>
+  <depend>tf2_sensor_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

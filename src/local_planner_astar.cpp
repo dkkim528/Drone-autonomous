@@ -60,7 +60,7 @@ public:
             "/global_path", 10, std::bind(&LocalPlanner::path_callback, this, _1));
         
         lidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            "/lidar", rclcpp::SensorDataQoS(), std::bind(&LocalPlanner::lidar_callback, this, _1));
+            "/lidar/points", rclcpp::SensorDataQoS(), std::bind(&LocalPlanner::lidar_callback, this, _1));
 
         // 4. 발행 (cmd_vel 삭제됨)
         // ★ 중요: Controller 팀은 이 토픽을 구독해야 함

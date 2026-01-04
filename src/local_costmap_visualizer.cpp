@@ -48,8 +48,8 @@ private:
 
         // Planner의 Grid 설정과 맞춰야 역계산 가능
         // (Planner 코드에 있는 설정값과 동일해야 함)
-        const int dim_x = 20; 
-        const int dim_y = 20; 
+        const int dim_x = 40; 
+        const int dim_y = 40; 
         const int dim_z = 10;
         const double grid_res = 0.2;
 

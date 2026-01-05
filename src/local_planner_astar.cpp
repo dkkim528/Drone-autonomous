@@ -62,8 +62,8 @@ public:
         lidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             "/lidar/points", rclcpp::SensorDataQoS(), std::bind(&LocalPlanner::lidar_callback, this, _1));
 
-        // 4. 발행 (cmd_vel 삭제됨)
-        // ★ 중요: Controller 팀은 이 토픽을 구독해야 함
+        // 4. 발행
+        // Controller 팀은 이 토픽(/local_path, frame_id: base_link)을 구독하여 제어함
         local_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/local_path", 10);
         
         // 디버깅 및 시각화용
@@ -96,7 +96,6 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr global_path_sub_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
     
-    // cmd_vel Publisher 제거됨
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr local_path_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr local_map_pub_;
@@ -115,7 +114,7 @@ private:
         latest_scan_ = msg;
     }
 
-    // --- 메인 루프 (경로 생성 전용) ---
+    // --- 메인 루프 ---
     void control_loop() {
         if (!latest_scan_) return;
 
@@ -142,7 +141,7 @@ private:
             
             if (p_base.pose.position.x < -0.5) continue; // 내 뒤는 무시
 
-            // 그리드 범위 밖이면 루프 중단 (여기까지만 Local Segment로 사용)
+            // 그리드 범위 밖이면 루프 중단
             if (std::abs(p_base.pose.position.x) > (grid_dim_x_ * grid_res_ / 2.0) || 
                 std::abs(p_base.pose.position.y) > (grid_dim_y_ * grid_res_ / 2.0)) {
                 break;
@@ -150,10 +149,10 @@ private:
             local_segment.poses.push_back(p_base);
         }
 
-        // 4. Smart Goal 선정 (장애물 없는 목표점 찾기)
+        // 4. Smart Goal 선정
         geometry_msgs::msg::Point local_goal = get_smart_local_goal(local_segment, tf_map_to_base);
 
-        // 5. 경로 결정 및 발행 (Controller 팀에게 전달)
+        // 5. 경로 결정 및 발행
         if (check_global_path_collision(local_segment)) {
             // Case A: 원래 경로가 안전함 -> Global Path 조각 그대로 발행
             local_path_pub_->publish(local_segment);
@@ -182,7 +181,7 @@ private:
             double z = p_base.pose.position.z;
             double dist = std::hypot(x, y);
 
-            if (dist < 1.0) continue; // 너무 가까운 점 무시
+            if (dist < 1.0) continue; 
 
             // 로컬 맵 범위 체크
             if (std::abs(x) > (grid_dim_x_ * grid_res_ / 2.0) - 0.5 ||
@@ -196,11 +195,10 @@ private:
             int idx_z = (int)(z / grid_res_) + (grid_dim_z_ / 2);
 
             if (is_valid_index(idx_x, idx_y, idx_z)) {
-                // 비어있는(false) 곳이면 목표 후보
                 if (!local_occupancy_[get_index(idx_x, idx_y, idx_z)]) {
                     valid_goal = p_base.pose.position;
                     found = true;
-                    if (dist > 3.5) break; // 적당히 멀면 확정
+                    if (dist > 3.5) break; 
                 }
             }
         }
@@ -270,7 +268,7 @@ private:
         if (!msg.data.empty()) local_map_pub_->publish(msg);
     }
 
-    // --- A* 실행 및 경로 발행 (반환값 void) ---
+    // --- A* 실행 및 경로 발행 ---
     void run_local_astar(const geometry_msgs::msg::Point& goal) {
         int start_x = grid_dim_x_ / 2;
         int start_y = grid_dim_y_ / 2;
@@ -333,22 +331,45 @@ private:
 
         if (final_node) {
             nav_msgs::msg::Path gui_path;
-            gui_path.header.frame_id = "base_link";
+            gui_path.header.frame_id = "base_link"; // 드론 기준 좌표계
             gui_path.header.stamp = this->now();
 
+            // 1. 역추적 (Goal -> Start)
             auto trace = final_node;
+            std::vector<geometry_msgs::msg::PoseStamped> raw_poses;
+
             while (trace) {
                 geometry_msgs::msg::PoseStamped pose;
                 pose.pose.position.x = (trace->x - start_x) * grid_res_;
                 pose.pose.position.y = (trace->y - start_y) * grid_res_;
                 pose.pose.position.z = (trace->z - start_z) * grid_res_;
-                pose.pose.orientation.w = 1.0;
-                gui_path.poses.push_back(pose);
+                pose.pose.orientation.w = 1.0; // Yaw는 추종 팀이 처리
+                raw_poses.push_back(pose);
                 trace = trace->parent;
             }
-            // ★ A* 결과 경로를 발행 (Controller가 따라갈 경로)
+            
+            // 2. 경로 순서 정렬 (Start -> Goal)
+            std::reverse(raw_poses.begin(), raw_poses.end());
+
+            // ★ [중요 수정] Pruning: 0.8m 이내의 점 제거 (드론 안정화)
+            double min_lookahead_dist = 0.8; 
+            
+            for (const auto& pose : raw_poses) {
+                double dist = std::hypot(pose.pose.position.x, pose.pose.position.y);
+                if (dist > min_lookahead_dist) {
+                    gui_path.poses.push_back(pose);
+                }
+            }
+
+            // 만약 너무 짧아서 다 잘렸다면 마지막 목표점은 보냄
+            if (gui_path.poses.empty() && !raw_poses.empty()) {
+                gui_path.poses.push_back(raw_poses.back());
+            }
+
+            // Path Smoothing 없음 (계단형 그대로 발행 -> Control 팀 처리)
             local_path_pub_->publish(gui_path);
             is_stuck_ = false;
+
         } else {
             handle_stuck_state(); // 경로 찾기 실패
         }
@@ -359,12 +380,6 @@ private:
         is_stuck_ = true;
         RCLCPP_WARN(this->get_logger(), "STUCK! No valid path found. Requesting Re-plan.");
         
-        // Controller에게 "갈 길 없음"을 알리기 위해 빈 경로 발행 (선택 사항)
-        // nav_msgs::msg::Path empty_path;
-        // empty_path.header.frame_id = "base_link";
-        // empty_path.header.stamp = this->now();
-        // local_path_pub_->publish(empty_path);
-
         auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
         replan_client_->async_send_request(request);
     }

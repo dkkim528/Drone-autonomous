@@ -31,7 +31,7 @@ find_package(octomap REQUIRED)
 # PCL 관련
 find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
-# find_package(pcl_ros REQUIRED) # ROS2 Humble에서는 보통 pcl_conversions만으로 충분함
+find_package(pcl_ros REQUIRED) # ROS2 Humble에서는 보통 pcl_conversions만으로 충분함
 
 # ============================================
 # 2. DynamicEDT3D 라이브러리 설정
@@ -128,7 +128,8 @@ ament_target_dependencies(local_planner_astar
   tf2_ros 
   tf2_geometry_msgs 
   tf2_sensor_msgs
-  pcl_conversions       
+  pcl_conversions
+  pcl_ros       
 )
 
 target_link_libraries(local_planner_astar 

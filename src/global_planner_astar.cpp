@@ -5,7 +5,8 @@
 #include <set>
 #include <tuple>
 #include <algorithm>
-#include <mutex> // [NEW] 쓰레드 충돌 방지
+#include <mutex>
+#include <chrono>
 
 #include <rclcpp/rclcpp.hpp>
 #include <octomap_msgs/msg/octomap.hpp>
@@ -18,7 +19,6 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 
-// [NEW] 서비스 및 포인트클라우드 관련 헤더
 #include <std_srvs/srv/trigger.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
@@ -28,10 +28,10 @@
 #include <visualization_msgs/msg/interactive_marker_feedback.hpp>
 
 using std::placeholders::_1;
-using std::placeholders::_2; // [NEW] 서비스 콜백용
+using std::placeholders::_2;
 using namespace visualization_msgs::msg; 
 
-// A* Node 구조체 (기존 동일)
+// A* 노드 구조체
 struct AStarNode {
     int x, y, z;
     double g_cost, h_cost;
@@ -50,161 +50,134 @@ class GlobalPlanner : public rclcpp::Node
 public:
   GlobalPlanner() : Node("global_planner_node")
   {
+    // [파라미터 설정]
+    // safe_radius: 로컬 플래너의 회피 거리(0.9m)보다 커야 Stuck 현상을 막음 (권장: 1.0 ~ 1.2m)
+    this->declare_parameter("safe_radius", 1.2);    
+    this->declare_parameter("resolution", 0.5);     // 맵 해상도
+    this->declare_parameter("min_z", 0.2);          // 드론 비행 최소 높이 (바닥 회피)
+    this->declare_parameter("max_z", 5.0);          // 드론 비행 최대 높이 (천장 회피)
+    this->declare_parameter("map_update_freq", 2.0); // 맵 업데이트(EDT 계산) 빈도 (Hz)
+
+    safe_radius_ = this->get_parameter("safe_radius").as_double();
+    resolution_ = this->get_parameter("resolution").as_double();
+    min_z_ = this->get_parameter("min_z").as_double();
+    max_z_ = this->get_parameter("max_z").as_double();
+    double update_freq = this->get_parameter("map_update_freq").as_double();
+
     // 1. TF Listener
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // 2. 맵 데이터 구독 (기존 맵)
+    // 2. 맵 데이터 구독
     rclcpp::QoS map_qos(1);
     map_qos.transient_local(); map_qos.reliable();
+    
+    // 초기 맵 (Octomap) 구독
     map_sub_ = this->create_subscription<octomap_msgs::msg::Octomap>(
       "/octomap_binary", map_qos, std::bind(&GlobalPlanner::octomap_callback, this, _1));
 
-    // [NEW] 2-1. 실시간 장애물 업데이트 구독 (Local에서 본 장애물)
-    // Local Planner나 Sensor Driver가 발행하는 PointCloud 토픽 이름으로 변경하세요.
+    // 실시간 장애물 (Local PointCloud) 구독
     obstacle_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       "/local_obstacles", 10, std::bind(&GlobalPlanner::obstacle_callback, this, _1));
 
-    // [NEW] 2-2. 재계획 요청 서비스 서버
+    // 3. 퍼블리셔 & 서비스
+    path_pub_ = this->create_publisher<nav_msgs::msg::Path>("global_path", 10);
+    
     replan_service_ = this->create_service<std_srvs::srv::Trigger>(
         "replan_path", std::bind(&GlobalPlanner::replan_callback, this, _1, _2));
 
-    // 3. 경로 발행
-    path_pub_ = this->create_publisher<nav_msgs::msg::Path>("global_path", 10);
-
-    // 4. Interactive Marker Server
+    // 4. Interactive Marker (Rviz 목표 지점 설정용)
     server_ = std::make_unique<interactive_markers::InteractiveMarkerServer>("goal_marker_server", this);
 
-    RCLCPP_INFO(this->get_logger(), "=== Planner Ready with Real-time Updates ===");
+    // [최적화] 맵 업데이트 타이머 (센서 콜백에서 분리하여 CPU 부하 감소)
+    int period_ms = static_cast<int>(1000.0 / update_freq);
+    map_update_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(period_ms), std::bind(&GlobalPlanner::update_map_event, this));
+
+    RCLCPP_INFO(this->get_logger(), "Global Planner Started. Safe Radius: %.2fm", safe_radius_);
   }
 
 private:
+  // --- 상태 변수 ---
   bool map_ready_ = false;
-  bool goal_received_ = false; // [NEW] 목표가 설정되었는지 확인
+  bool map_needs_update_ = false; // 맵 변경 플래그
+  bool goal_received_ = false;
   octomap::point3d goal_pos_;
 
   std::shared_ptr<octomap::OcTree> octree_;
   std::shared_ptr<DynamicEDTOctomap> distmap_;
-  std::mutex map_mutex_; // [NEW] 지도 읽기/쓰기 충돌 방지용
+  std::mutex map_mutex_; // 멀티스레드 충돌 방지
 
-  double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
-  float max_dist_ = 2.0;   
-  double resolution_ = 0.5; 
-  double safe_radius_ = 0.6;
+  // --- 맵 경계 변수 (여기가 수정됨) ---
+  // x, y, z의 최소/최대 물리적 좌표 (Octomap 전체 크기)
+  double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_; 
 
-  // [NEW] 재계획 서비스 콜백 (Local Planner가 호출)
-  void replan_callback(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-                       std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-  {
-      (void)request; // unused warning 방지
+  // --- 파라미터 변수 ---
+  double min_z_, max_z_; // 비행 허용 높이
+  double safe_radius_;
+  double resolution_;
+  float max_dist_ = 2.5; // EDT 계산 최대 거리 (너무 크면 느려짐)
 
-      if (!map_ready_ || !goal_received_) {
-          response->success = false;
-          response->message = "Map not ready or Goal not set yet.";
-          RCLCPP_WARN(this->get_logger(), "Replan ignored: Map/Goal missing.");
-          return;
-      }
+  // ---------------------------------------------------------
+  // [최적화 핵심 1] 타이머 기반 맵 업데이트
+  // ---------------------------------------------------------
+  void update_map_event() {
+      if (!map_ready_ || !map_needs_update_) return;
 
-      RCLCPP_INFO(this->get_logger(), "[Re-Plan] Re-planning triggered by Local Planner...");
-      
-      octomap::point3d start_pos;
-      if(get_drone_position(start_pos)) {
-           // 현재 위치에서 기존 목표까지 다시 계산
-           run_planning_algorithm(start_pos, goal_pos_);
-           response->success = true;
-           response->message = "Re-planning initiated.";
-      } else {
-           response->success = false;
-           response->message = "Could not get drone position.";
-      }
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      // 무거운 거리 계산(EDT Update)은 여기서 주기적으로 수행
+      distmap_->update(); 
+      map_needs_update_ = false;
   }
 
-  // [NEW] 실시간 장애물 업데이트 콜백
+  // ---------------------------------------------------------
+  // [최적화 핵심 2] 장애물 추가 (연산 최소화)
+  // ---------------------------------------------------------
   void obstacle_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
-      if (!map_ready_) return; // 기본 맵이 없으면 무시
+      if (!map_ready_) return;
 
-      // 중요: 맵을 수정하므로 Mutex 잠금
       std::lock_guard<std::mutex> lock(map_mutex_);
-
-      // PointCloud2 -> Octomap Insert
+      
+      // PointCloud -> Octomap (단순 삽입은 빠름)
       sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
       sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
       sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
 
+      bool changed = false;
       for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
-          // 센서의 점을 'Occupied'로 맵에 추가
-          octree_->updateNode(octomap::point3d(*iter_x, *iter_y, *iter_z), true);
+          octomap::point3d p(*iter_x, *iter_y, *iter_z);
+          
+          // 비행 허용 높이 바깥의 장애물은 굳이 로컬 플래닝에 반영 안 함 (선택 사항)
+          // 여기서는 안전을 위해 맵 전체 범위 내라면 반영
+          if(p.x() < x_min_ || p.x() > x_max_ || p.y() < y_min_ || p.y() > y_max_) continue;
+
+          // 노드 업데이트 (점유됨으로 표시)
+          octree_->updateNode(p, true);
+          changed = true;
       }
 
-      // ESDF 거리 지도 업데이트 (변경된 부분 반영)
-      // *주의: 전체 업데이트는 무거울 수 있음. 너무 느리면 타이머로 묶어서 주기적으로 실행하세요.
-      distmap_->update(); 
-      // RCLCPP_INFO(this->get_logger(), "Map updated with new obstacles.");
-  }
-
-  // Interactive Marker 생성 (기존 동일)
-  void create_marker(const octomap::point3d& pos) {
-      InteractiveMarker int_marker;
-      int_marker.header.frame_id = "map";
-      int_marker.header.stamp = this->now();
-      int_marker.name = "goal_marker";
-      int_marker.description = "Goal";
-      int_marker.scale = 1.0;
-      int_marker.pose.position.x = pos.x();
-      int_marker.pose.position.y = pos.y();
-      int_marker.pose.position.z = pos.z();
-
-      InteractiveMarkerControl control;
-      
-      control.orientation.w = 1; control.orientation.x = 1; control.orientation.y = 0; control.orientation.z = 0;
-      control.name = "move_x"; control.interaction_mode = InteractiveMarkerControl::MOVE_AXIS;
-      int_marker.controls.push_back(control);
-
-      control.orientation.w = 1; control.orientation.x = 0; control.orientation.y = 1; control.orientation.z = 0;
-      control.name = "move_z"; control.interaction_mode = InteractiveMarkerControl::MOVE_AXIS;
-      int_marker.controls.push_back(control);
-
-      control.orientation.w = 1; control.orientation.x = 0; control.orientation.y = 0; control.orientation.z = 1;
-      control.name = "move_y"; control.interaction_mode = InteractiveMarkerControl::MOVE_AXIS;
-      int_marker.controls.push_back(control);
-
-      server_->insert(int_marker);
-      server_->setCallback(int_marker.name, std::bind(&GlobalPlanner::process_feedback, this, _1));
-      server_->applyChanges();
-  }
-
-  void process_feedback(const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr & feedback)
-  {
-      if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
-          goal_pos_ = octomap::point3d(feedback->pose.position.x, feedback->pose.position.y, feedback->pose.position.z);
-          goal_received_ = true; // [NEW] 목표 수신 플래그
-      }
-      if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::MOUSE_UP) {
-          octomap::point3d start_pos;
-          if(get_drone_position(start_pos)) {
-               run_planning_algorithm(start_pos, goal_pos_);
-          } else {
-               RCLCPP_WARN(this->get_logger(), "Cannot find 'base_link' TF.");
-          }
+      if (changed) {
+          map_needs_update_ = true; // 타이머에게 "업데이트 필요함" 알림
       }
   }
 
+  // ---------------------------------------------------------
+  // A* 알고리즘
+  // ---------------------------------------------------------
   void run_planning_algorithm(const octomap::point3d& start, const octomap::point3d& goal)
   {
-      // [NEW] 계산 중 맵이 바뀌면 안 되므로 Mutex 잠금
       std::lock_guard<std::mutex> lock(map_mutex_);
 
-      RCLCPP_INFO(this->get_logger(), "[Plan] A* Start: (%.1f, %.1f, %.1f) -> (%.1f, %.1f, %.1f)", 
-          start.x(), start.y(), start.z(), goal.x(), goal.y(), goal.z());
+      RCLCPP_INFO(this->get_logger(), "[Plan] Start A*... Safe Radius: %.2fm", safe_radius_);
 
-      if (distmap_->getDistance(start) < safe_radius_ && distmap_->getDistance(start) >= 0) {
-          RCLCPP_WARN(this->get_logger(), "Start point is inside obstacle! (Dist: %.2f)", distmap_->getDistance(start));
-          // [Tip] 시작점이 벽이면 약간 튀어나오게 처리하는 로직을 추가해도 됨
-          return;
+      // 시작점이 장애물인지 체크 (EDT 사용)
+      float start_dist = distmap_->getDistance(start);
+      // d < 0은 unknown space. 0 이상이면서 safe_radius보다 작으면 위험
+      if (start_dist < safe_radius_ && start_dist >= 0) {
+          RCLCPP_WARN(this->get_logger(), "Start is too close to obstacle (%.2fm). Planning anyway...", start_dist);
       }
-      
-      // ... (Open List, Closed Set 초기화는 동일) ...
+
       std::priority_queue<std::shared_ptr<AStarNode>, std::vector<std::shared_ptr<AStarNode>>, CompareNode> open_list;
       std::set<std::tuple<int, int, int>> closed_set;
 
@@ -222,11 +195,15 @@ private:
       
       std::shared_ptr<AStarNode> final_node = nullptr;
       int iterations = 0;
+      int max_iter = 100000; // 무한 루프 방지
 
       while(!open_list.empty()) {
           auto current = open_list.top(); open_list.pop();
           
-          if(++iterations > 2000000) { RCLCPP_WARN(this->get_logger(), "Timeout! Path blocked or too long."); return; }
+          if(++iterations > max_iter) { 
+              RCLCPP_WARN(this->get_logger(), "A* Timeout! Iterations exceeded."); 
+              break; 
+          }
 
           if (std::abs(current->x - gx) <= 1 && std::abs(current->y - gy) <= 1 && std::abs(current->z - gz) <= 1) {
               final_node = current; break;
@@ -240,25 +217,36 @@ private:
              for(int dy=-1; dy<=1; dy++) {
                 for(int dz=-1; dz<=1; dz++) {
                    if(dx==0 && dy==0 && dz==0) continue;
-                   int nx = current->x+dx, ny = current->y+dy, nz = current->z+dz;
+                   
+                   int nx = current->x+dx;
+                   int ny = current->y+dy; 
+                   int nz = current->z+dz;
+                   
                    octomap::point3d w_pos(nx*resolution_, ny*resolution_, nz*resolution_);
 
-                   // 바닥 & 천장 체크
-                   if (w_pos.z() < 0.5) continue; 
-                   if (w_pos.z() > 4.0) continue; 
+                   // [제약 조건] 비행 높이 제한 (파라미터 사용)
+                   if (w_pos.z() < min_z_) continue; 
+                   if (w_pos.z() > max_z_) continue; 
                    
-                   // 맵 범위 체크
-                   if(w_pos.x()<x_min_ || w_pos.x()>x_max_ || w_pos.y()<y_min_ || w_pos.y()>y_max_ || w_pos.z()<z_min_ || w_pos.z()>z_max_) continue;
+                   // [제약 조건] 맵 전체 범위 체크
+                   if(w_pos.x()<x_min_ || w_pos.x()>x_max_ || w_pos.y()<y_min_ || w_pos.y()>y_max_) continue;
                    
-                   // 장애물 거리 체크 (distmap_은 Mutex로 보호 중)
+                   // [제약 조건] 장애물 거리 체크 (가장 중요)
                    float d = distmap_->getDistance(w_pos);
+                   
+                   // d >= 0 인 경우(알려진 공간)에만 검사
                    if(d < safe_radius_ && d >= 0) continue; 
+
+                   // 비용 계산
+                   double step_dist = std::sqrt(dx*dx + dy*dy + dz*dz) * resolution_;
 
                    auto neighbor = std::make_shared<AStarNode>();
                    neighbor->x = nx; neighbor->y = ny; neighbor->z = nz;
                    neighbor->parent = current;
-                   neighbor->g_cost = current->g_cost + std::sqrt(dx*dx+dy*dy+dz*dz);
-                   neighbor->h_cost = (w_pos - goal).norm() * 2.0; // Weighted A*
+                   neighbor->g_cost = current->g_cost + step_dist;
+                   
+                   // Heuristic: Weighted A* (1.5배 가중치)
+                   neighbor->h_cost = (w_pos - goal).norm() * 1.5; 
                    
                    open_list.push(neighbor);
                 }
@@ -267,7 +255,50 @@ private:
       }
 
       if(final_node) publish_path(final_node);
-      else RCLCPP_WARN(this->get_logger(), "Failed to find path. The obstacle might be blocking all ways.");
+      else RCLCPP_WARN(this->get_logger(), "Failed to find global path!");
+  }
+
+  // --- 서비스 콜백 ---
+  void replan_callback(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                       std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+  {
+      if (!map_ready_ || !goal_received_) {
+          response->success = false; response->message = "Not ready."; return;
+      }
+      octomap::point3d start_pos;
+      if(get_drone_position(start_pos)) {
+           run_planning_algorithm(start_pos, goal_pos_);
+           response->success = true; response->message = "Replanned.";
+      } else {
+           response->success = false; response->message = "No TF.";
+      }
+  }
+
+  // --- 초기 맵 로드 콜백 ---
+  void octomap_callback(const octomap_msgs::msg::Octomap::SharedPtr msg)
+  {
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      if (map_ready_) return; 
+      
+      octomap::AbstractOcTree* tree = octomap_msgs::binaryMsgToMap(*msg);
+      if (!tree) return;
+      
+      octree_ = std::shared_ptr<octomap::OcTree>(dynamic_cast<octomap::OcTree*>(tree));
+      if (octree_) {
+          // [중요] 맵 전체 경계값 로드 (여기서 에러가 발생했었음)
+          octree_->getMetricMin(x_min_, y_min_, z_min_); 
+          octree_->getMetricMax(x_max_, y_max_, z_max_);
+          
+          // EDT 맵 초기화
+          distmap_ = std::make_shared<DynamicEDTOctomap>(max_dist_, octree_.get(), 
+              octomap::point3d(x_min_, y_min_, z_min_), 
+              octomap::point3d(x_max_, y_max_, z_max_), false);
+          distmap_->update();
+          
+          map_ready_ = true;
+          create_marker(octomap::point3d(0, 0, 1.0));
+          RCLCPP_INFO(this->get_logger(), "Initial Map Processed. Bounds: Z[%.2f ~ %.2f]", z_min_, z_max_);
+      }
   }
 
   void publish_path(std::shared_ptr<AStarNode> node)
@@ -279,7 +310,6 @@ private:
       std::vector<geometry_msgs::msg::PoseStamped> poses;
       while(node) {
           geometry_msgs::msg::PoseStamped p;
-          p.header.frame_id = "map";
           p.pose.position.x = node->x * resolution_;
           p.pose.position.y = node->y * resolution_;
           p.pose.position.z = node->z * resolution_;
@@ -290,34 +320,6 @@ private:
       std::reverse(poses.begin(), poses.end());
       path_msg.poses = poses;
       path_pub_->publish(path_msg);
-      RCLCPP_INFO(this->get_logger(), "Path Published! (%zu points)", poses.size());
-  }
-
-  void octomap_callback(const octomap_msgs::msg::Octomap::SharedPtr msg)
-  {
-      // [NEW] Mutex 잠금: 초기 맵 생성 시에도 보호
-      std::lock_guard<std::mutex> lock(map_mutex_);
-
-      if (map_ready_) return; // 최초 1회만 받음 (업데이트는 PointCloud2로)
-      RCLCPP_INFO(this->get_logger(), "[Plan] Processing Initial Map...");
-      
-      octomap::AbstractOcTree* tree = octomap_msgs::binaryMsgToMap(*msg);
-      if (!tree) return;
-      octree_ = std::shared_ptr<octomap::OcTree>(dynamic_cast<octomap::OcTree*>(tree));
-      if (octree_) {
-          octree_->getMetricMin(x_min_, y_min_, z_min_);
-          octree_->getMetricMax(x_max_, y_max_, z_max_);
-          
-          distmap_ = std::make_shared<DynamicEDTOctomap>(max_dist_, octree_.get(), 
-              octomap::point3d(x_min_, y_min_, z_min_), 
-              octomap::point3d(x_max_, y_max_, z_max_), false);
-          distmap_->update();
-          
-          map_ready_ = true;
-          RCLCPP_INFO(this->get_logger(), "[Plan] Map Ready!");
-          
-          create_marker(octomap::point3d(0, 0, 1.0));
-      }
   }
 
   bool get_drone_position(octomap::point3d &pos)
@@ -328,16 +330,52 @@ private:
       pos.y() = t.transform.translation.y;
       pos.z() = t.transform.translation.z;
       return true;
-    } catch (const tf2::TransformException & ex) {
-      return false;
-    }
+    } catch (...) { return false; }
+  }
+
+  void create_marker(const octomap::point3d& pos) {
+      InteractiveMarker int_marker;
+      int_marker.header.frame_id = "map";
+      int_marker.name = "goal";
+      int_marker.scale = 1.0;
+      int_marker.pose.position.x = pos.x();
+      int_marker.pose.position.y = pos.y();
+      int_marker.pose.position.z = pos.z();
+
+      InteractiveMarkerControl control;
+      control.orientation.w = 1; control.orientation.x = 1; control.orientation.y = 0; control.orientation.z = 0;
+      control.interaction_mode = InteractiveMarkerControl::MOVE_AXIS;
+      int_marker.controls.push_back(control);
+      
+      control.orientation.w = 1; control.orientation.x = 0; control.orientation.y = 1; control.orientation.z = 0;
+      control.interaction_mode = InteractiveMarkerControl::MOVE_AXIS;
+      int_marker.controls.push_back(control);
+
+      control.orientation.w = 1; control.orientation.x = 0; control.orientation.y = 0; control.orientation.z = 1;
+      control.interaction_mode = InteractiveMarkerControl::MOVE_AXIS;
+      int_marker.controls.push_back(control);
+
+      server_->insert(int_marker);
+      server_->setCallback(int_marker.name, std::bind(&GlobalPlanner::process_feedback, this, _1));
+      server_->applyChanges();
+  }
+
+  void process_feedback(const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr & feedback) {
+      if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
+          goal_pos_ = octomap::point3d(feedback->pose.position.x, feedback->pose.position.y, feedback->pose.position.z);
+          goal_received_ = true;
+      }
+      if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::MOUSE_UP) {
+          octomap::point3d start;
+          if(get_drone_position(start)) run_planning_algorithm(start, goal_pos_);
+      }
   }
 
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr map_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_sub_; // [NEW]
-  
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr replan_service_; // [NEW]
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr replan_service_;
+  rclcpp::TimerBase::SharedPtr map_update_timer_; 
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -347,8 +385,10 @@ private:
 int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
-  // MultiThreadedExecutor를 쓰면 더 좋지만, Mutex를 썼으므로 기본 스핀도 괜찮습니다.
-  rclcpp::spin(std::make_shared<GlobalPlanner>());
+  rclcpp::executors::MultiThreadedExecutor executor;
+  auto node = std::make_shared<GlobalPlanner>();
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

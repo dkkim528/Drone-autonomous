@@ -46,10 +46,24 @@ class LocalPlanner : public rclcpp::Node
 public:
     LocalPlanner() : Node("local_planner_node")
     {
-        this->declare_parameter("safety_distance", 0.5); 
+        // ==========================================
+        // [수정] 파라미터 선언 및 로드 (YAML 연동)
+        // ==========================================
+        this->declare_parameter("local_grid_resolution", 0.2); // 격자 해상도 (m)
+        this->declare_parameter("local_grid_width", 40);       // X축 격자 개수
+        this->declare_parameter("local_grid_height", 40);      // Y축 격자 개수
+        this->declare_parameter("local_grid_depth", 50);       // Z축 격자 개수
+        this->declare_parameter("safety_distance", 0.5);       // 장애물 회피 거리
+
+        grid_res_ = this->get_parameter("local_grid_resolution").as_double();
+        grid_dim_x_ = this->get_parameter("local_grid_width").as_int();
+        grid_dim_y_ = this->get_parameter("local_grid_height").as_int();
+        grid_dim_z_ = this->get_parameter("local_grid_depth").as_int();
         safety_distance_ = this->get_parameter("safety_distance").as_double();
 
-        RCLCPP_INFO(this->get_logger(), "Local Planner Started. Safety Dist: %.2f m", safety_distance_);
+        RCLCPP_INFO(this->get_logger(), "Local Planner Started.");
+        RCLCPP_INFO(this->get_logger(), "Grid: [%d x %d x %d], Res: %.2f, SafeDist: %.2f", 
+            grid_dim_x_, grid_dim_y_, grid_dim_z_, grid_res_, safety_distance_);
 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -69,11 +83,11 @@ public:
     }
 
 private:
-    const double grid_res_ = 0.2;     
-    const int grid_dim_x_ = 40;       
-    const int grid_dim_y_ = 40;       
-    // [설정] 위로 갈 "수"도 있게 공간만 확보 (강제 아님)
-    const int grid_dim_z_ = 50;       
+    // [수정] const 제거 -> 파라미터 변수로 변경
+    double grid_res_;     
+    int grid_dim_x_;       
+    int grid_dim_y_;       
+    int grid_dim_z_;       
     
     double safety_distance_;
 
@@ -160,7 +174,7 @@ private:
             tf_map_to_base = tf_buffer_->lookupTransform("base_link", "map", tf2::TimePointZero);
         } catch (tf2::TransformException &ex) { return; }
 
-        // [Method B] Path Reuse (Hysteresis)
+        // [Method B] Path Reuse
         if (has_last_path_) {
             nav_msgs::msg::Path reused_path_local;
             reused_path_local.header.frame_id = "base_link";
@@ -198,7 +212,7 @@ private:
         }
     }
 
-    // --- A* Algorithm (Standard Metric + Method A Bias) ---
+    // --- A* Algorithm ---
 
     void run_local_astar(const geometry_msgs::msg::Point& goal) {
         int start_x = grid_dim_x_ / 2;
@@ -220,9 +234,8 @@ private:
         start_node->x = start_x; start_node->y = start_y; start_node->z = start_z;
         start_node->g = 0; 
         
-        // [수정] 순수 유클리드 거리 (X, Y, Z 공평)
         double dist = std::hypot(goal_x - start_x, goal_y - start_y, goal_z - start_z);
-        start_node->h = dist * 1.05; // Bias만 유지
+        start_node->h = dist * 1.05; 
         
         open_list.push(start_node);
 
@@ -253,12 +266,8 @@ private:
                             neighbor->parent = current;
                             neighbor->g = current->g + std::sqrt(dx*dx + dy*dy + dz*dz);
                             
-                            // [수정 완료] Z축 인센티브 제거.
-                            // 이제 드론은 "수학적으로 가장 짧은 우회로"를 선택합니다.
-                            // 옆으로 2m 돌아가기 vs 위로 3m 넘어가기 -> 옆을 선택.
-                            // 옆이 꽉 막힘 vs 위로 3m 넘어가기 -> 위를 선택.
                             double h_val = std::hypot(goal_x - nx, goal_y - ny, goal_z - nz);
-                            neighbor->h = h_val * 1.05; // [Method A] Bias는 유지
+                            neighbor->h = h_val * 1.05; 
 
                             open_list.push(neighbor);
                         }

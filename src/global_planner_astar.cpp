@@ -54,8 +54,8 @@ public:
     // safe_radius: 로컬 플래너의 회피 거리(0.9m)보다 커야 Stuck 현상을 막음 (권장: 1.0 ~ 1.2m)
     this->declare_parameter("safe_radius", 1.2);    
     this->declare_parameter("resolution", 0.5);     // 맵 해상도
-    this->declare_parameter("min_z", 0.2);          // 드론 비행 최소 높이 (바닥 회피)
-    this->declare_parameter("max_z", 5.0);          // 드론 비행 최대 높이 (천장 회피)
+    this->declare_parameter("min_z", 0.5);          // 드론 비행 최소 높이 (바닥 회피)
+    this->declare_parameter("max_z", 2.5);          // 드론 비행 최대 높이 (천장 회피)
     this->declare_parameter("map_update_freq", 2.0); // 맵 업데이트(EDT 계산) 빈도 (Hz)
 
     safe_radius_ = this->get_parameter("safe_radius").as_double();
@@ -94,7 +94,7 @@ public:
     map_update_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(period_ms), std::bind(&GlobalPlanner::update_map_event, this));
 
-    RCLCPP_INFO(this->get_logger(), "Global Planner Started. Safe Radius: %.2fm", safe_radius_);
+    RCLCPP_INFO(this->get_logger(), "Global Planner Started. Safe Radius: %.2fm, Height Limit: %.1f ~ %.1f m", safe_radius_, min_z_, max_z_);
   }
 
 private:
@@ -108,15 +108,14 @@ private:
   std::shared_ptr<DynamicEDTOctomap> distmap_;
   std::mutex map_mutex_; // 멀티스레드 충돌 방지
 
-  // --- 맵 경계 변수 (여기가 수정됨) ---
-  // x, y, z의 최소/최대 물리적 좌표 (Octomap 전체 크기)
+  // --- 맵 경계 변수 ---
   double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_; 
 
   // --- 파라미터 변수 ---
   double min_z_, max_z_; // 비행 허용 높이
   double safe_radius_;
   double resolution_;
-  float max_dist_ = 2.5; // EDT 계산 최대 거리 (너무 크면 느려짐)
+  float max_dist_ = 2.5; // EDT 계산 최대 거리
 
   // ---------------------------------------------------------
   // [최적화 핵심 1] 타이머 기반 맵 업데이트
@@ -125,13 +124,12 @@ private:
       if (!map_ready_ || !map_needs_update_) return;
 
       std::lock_guard<std::mutex> lock(map_mutex_);
-      // 무거운 거리 계산(EDT Update)은 여기서 주기적으로 수행
       distmap_->update(); 
       map_needs_update_ = false;
   }
 
   // ---------------------------------------------------------
-  // [최적화 핵심 2] 장애물 추가 (연산 최소화)
+  // [최적화 핵심 2] 장애물 추가
   // ---------------------------------------------------------
   void obstacle_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
@@ -139,7 +137,6 @@ private:
 
       std::lock_guard<std::mutex> lock(map_mutex_);
       
-      // PointCloud -> Octomap (단순 삽입은 빠름)
       sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
       sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
       sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
@@ -148,32 +145,41 @@ private:
       for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
           octomap::point3d p(*iter_x, *iter_y, *iter_z);
           
-          // 비행 허용 높이 바깥의 장애물은 굳이 로컬 플래닝에 반영 안 함 (선택 사항)
-          // 여기서는 안전을 위해 맵 전체 범위 내라면 반영
           if(p.x() < x_min_ || p.x() > x_max_ || p.y() < y_min_ || p.y() > y_max_) continue;
 
-          // 노드 업데이트 (점유됨으로 표시)
           octree_->updateNode(p, true);
           changed = true;
       }
 
       if (changed) {
-          map_needs_update_ = true; // 타이머에게 "업데이트 필요함" 알림
+          map_needs_update_ = true;
       }
   }
 
   // ---------------------------------------------------------
-  // A* 알고리즘
+  // A* 알고리즘 (수정됨: Goal 높이 보정 추가)
   // ---------------------------------------------------------
-  void run_planning_algorithm(const octomap::point3d& start, const octomap::point3d& goal)
+  void run_planning_algorithm(const octomap::point3d& start, const octomap::point3d& original_goal)
   {
       std::lock_guard<std::mutex> lock(map_mutex_);
 
-      RCLCPP_INFO(this->get_logger(), "[Plan] Start A*... Safe Radius: %.2fm", safe_radius_);
+      // ==========================================
+      // [수정 포인트] 목표점 높이 강제 보정 (Clamping)
+      // ==========================================
+      octomap::point3d goal = original_goal;
+      
+      if (goal.z() > max_z_) goal.z() = max_z_;
+      if (goal.z() < min_z_) goal.z() = min_z_;
 
-      // 시작점이 장애물인지 체크 (EDT 사용)
+      RCLCPP_INFO(this->get_logger(), "[Plan] Start A*... Safe Radius: %.2fm, Goal Adjusted Z: %.2f", safe_radius_, goal.z());
+
+      // [안전 체크] 시작점이 비행 금지 구역(높이)일 경우 경고
+      if (start.z() > max_z_ + 0.5 || start.z() < min_z_ - 0.5) {
+           RCLCPP_WARN(this->get_logger(), "CAUTION: Drone is currently outside flight altitude limits!");
+      }
+
+      // 시작점이 장애물인지 체크
       float start_dist = distmap_->getDistance(start);
-      // d < 0은 unknown space. 0 이상이면서 safe_radius보다 작으면 위험
       if (start_dist < safe_radius_ && start_dist >= 0) {
           RCLCPP_WARN(this->get_logger(), "Start is too close to obstacle (%.2fm). Planning anyway...", start_dist);
       }
@@ -189,13 +195,14 @@ private:
       start_node->h_cost = (goal - start).norm();
       open_list.push(start_node);
 
+      // 목표점 인덱스 (보정된 goal 사용)
       int gx = (int)(goal.x()/resolution_);
       int gy = (int)(goal.y()/resolution_);
       int gz = (int)(goal.z()/resolution_);
       
       std::shared_ptr<AStarNode> final_node = nullptr;
       int iterations = 0;
-      int max_iter = 100000; // 무한 루프 방지
+      int max_iter = 100000; 
 
       while(!open_list.empty()) {
           auto current = open_list.top(); open_list.pop();
@@ -224,20 +231,15 @@ private:
                    
                    octomap::point3d w_pos(nx*resolution_, ny*resolution_, nz*resolution_);
 
-                   // [제약 조건] 비행 높이 제한 (파라미터 사용)
-                   if (w_pos.z() < min_z_) continue; 
-                   if (w_pos.z() > max_z_) continue; 
+                   // [제약 조건] 비행 높이 제한 (중간 경로도 제한)
+                   if (w_pos.z() < min_z_ - 0.01) continue; 
+                   if (w_pos.z() > max_z_ + 0.01) continue; 
                    
-                   // [제약 조건] 맵 전체 범위 체크
                    if(w_pos.x()<x_min_ || w_pos.x()>x_max_ || w_pos.y()<y_min_ || w_pos.y()>y_max_) continue;
                    
-                   // [제약 조건] 장애물 거리 체크 (가장 중요)
                    float d = distmap_->getDistance(w_pos);
-                   
-                   // d >= 0 인 경우(알려진 공간)에만 검사
                    if(d < safe_radius_ && d >= 0) continue; 
 
-                   // 비용 계산
                    double step_dist = std::sqrt(dx*dx + dy*dy + dz*dz) * resolution_;
 
                    auto neighbor = std::make_shared<AStarNode>();
@@ -245,7 +247,7 @@ private:
                    neighbor->parent = current;
                    neighbor->g_cost = current->g_cost + step_dist;
                    
-                   // Heuristic: Weighted A* (1.5배 가중치)
+                   // Heuristic: 보정된 goal 기준
                    neighbor->h_cost = (w_pos - goal).norm() * 1.5; 
                    
                    open_list.push(neighbor);
@@ -285,11 +287,9 @@ private:
       
       octree_ = std::shared_ptr<octomap::OcTree>(dynamic_cast<octomap::OcTree*>(tree));
       if (octree_) {
-          // [중요] 맵 전체 경계값 로드 (여기서 에러가 발생했었음)
           octree_->getMetricMin(x_min_, y_min_, z_min_); 
           octree_->getMetricMax(x_max_, y_max_, z_max_);
           
-          // EDT 맵 초기화
           distmap_ = std::make_shared<DynamicEDTOctomap>(max_dist_, octree_.get(), 
               octomap::point3d(x_min_, y_min_, z_min_), 
               octomap::point3d(x_max_, y_max_, z_max_), false);

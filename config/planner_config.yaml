@@ -1,0 +1,15 @@
+/**:
+  ros__parameters:
+    # --- Global Planner 설정 ---
+    min_z: 0.2               # 최소 비행 높이
+    max_z: 4.5                # 최대 비행 높이 (천장 높이)
+    safe_radius: 0.8          # 글로벌 경로 회피 거리
+    resolution: 0.5           # Octomap 해상도
+    map_update_freq: 2.0      # EDT 업데이트 빈도
+
+    # --- Local Planner 설정 ---
+    safety_distance: 0.5      # 로컬 긴급 회피 거리 (글로벌보다 작아야 함)
+    local_grid_resolution: 0.2
+    local_grid_width: 40      # X축 (앞뒤) 격자 개수
+    local_grid_height: 40     # Y축 (좌우) 격자 개수
+    local_grid_depth: 50      # Z축 (상하) 격자 개수
